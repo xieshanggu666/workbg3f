@@ -487,6 +487,20 @@ export const useGameStore = defineStore('game', {
         } else this.showToast('已取消（无未开工批次可退料）', 'info')
       }, { denyPerm: 'cancelJob' })
     },
+    async reduceProduction(id, qty = 1) {
+      const r = await this._commit(async () => {
+        const d = await api('/production/reduce', 'POST', { id, qty })
+        await this.load({ silent: true })
+        return d
+      }, { denyPerm: 'cancelJob' })
+      if (r) {
+        if (r.refunds?.length) {
+          const items = r.refunds.map((it) => `${it.name}×${it.qty}`).join('、')
+          this.showToast(`已减 ${r.reduced} 批，退回原料：${items}`, 'info')
+        } else this.showToast(`已减 ${r.reduced} 批`, 'info')
+      }
+      return r
+    },
     async reorderProduction(id, dir) {
       const r = await this._commit(async () => {
         const d = await api('/production/reorder', 'POST', { id, dir })
@@ -633,7 +647,7 @@ const ACTION_LABELS = {
   plant: '播种', water: '浇水', fertilize: '施肥', clean: '除虫', harvest: '收获',
   nextday: '时间推进/灾害结算', protect: '防灾投入', buymat: '购买物资', buyseed: '购买种子',
   sellcrop: '出售作物', adopt: '领养动物', feed: '喂食', collect: '收集产物',
-  'production/enqueue': '加工排产', 'production/cancel': '取消工单', 'production/reorder': '队列重排', 'production/collect': '加工入库',
+  'production/enqueue': '加工排产', 'production/cancel': '取消工单', 'production/reduce': '工单减量退料', 'production/reorder': '队列重排', 'production/collect': '加工入库',
   'irrigation/build': '建造灌溉设施', 'irrigation/toggle': '灌溉设施启停', 'irrigation/demolish': '拆除灌溉设施',
   'irrigation/priority': '灌溉优先级', 'irrigation/target': '灌溉目标水分',
   'breeding/start': '杂交试验', 'breeding/care': '试验养护', 'breeding/cancel': '取消试验',

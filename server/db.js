@@ -241,6 +241,12 @@ if (tableExists('production_jobs')) {
   if (needBackfill) {
     db.exec('UPDATE production_jobs SET seq=id WHERE seq=0')
   }
+  // 分批入库扩展：collected 记录已入库批次数（完工批次可随时部分入库，不必整单领走）
+  if (!columnExists('production_jobs', 'collected')) {
+    db.exec('ALTER TABLE production_jobs ADD COLUMN collected INTEGER NOT NULL DEFAULT 0')
+    // 历史已入库工单回填，避免被当作待入库重复发放成品
+    db.exec("UPDATE production_jobs SET collected=qty WHERE status='collected'")
+  }
 }
 
 // 全新存档：建立完整多农场版表结构
@@ -386,6 +392,7 @@ CREATE TABLE IF NOT EXISTS production_jobs (
   days INTEGER NOT NULL,                -- 每批耗时（游戏天）
   qty INTEGER NOT NULL,                 -- 批次数
   finished INTEGER NOT NULL DEFAULT 0,  -- 已完工批次数（跨天结算时落库）
+  collected INTEGER NOT NULL DEFAULT 0, -- 已入库批次数（完工批次可随时部分入库）
   enqueue_abs INTEGER NOT NULL,         -- 排产时的绝对天
   cancel_abs INTEGER DEFAULT NULL,      -- 取消时的绝对天（NULL 未取消）
   inputs TEXT DEFAULT NULL,             -- 按批次登记的实际投料明细（JSON，取消时原样退回）

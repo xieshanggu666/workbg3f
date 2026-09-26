@@ -4,7 +4,7 @@ import { ensureLegacySeed } from './seed.js'
 import { TYPES, ensureWeather, settleWeather, currentWeather } from './weather.js'
 import {
   RECIPES, capacity, listJobs, queuedBatches, reservedStock,
-  settleProduction, enqueueJob, cancelJob, reorderJob, collectJobs
+  settleProduction, enqueueJob, cancelJob, reduceJob, reorderJob, collectJobs
 } from './production.js'
 import {
   COSTS as IRR_COSTS, RESERVOIR_CAP, networkInfo, computeNetworks, lastReport,
@@ -556,6 +556,17 @@ app.post('/api/production/cancel', ...mutate('cancelJob', 'production/cancel', (
   })
 }))
 
+// 工单减量：按需减掉尾部未开工批次，按登记的实际品种退料（权限边界同取消）
+app.post('/api/production/reduce', ...mutate('cancelJob', 'production/reduce', (req) => {
+  const fid = req.ctx.farmId
+  const p = q1('SELECT abs_day FROM player WHERE farm_id=?', fid)
+  return reduceJob({
+    id: Number(req.body?.id), reduce: Number(req.body?.qty) || 1,
+    currentAbs: p.abs_day, farmId: fid,
+    userId: req.ctx.user.id, role: req.ctx.role
+  })
+}))
+
 // 队列重排：未开工工单上移/下移一位，已开工工单钉死不动
 app.post('/api/production/reorder', ...mutate('reorderJob', 'production/reorder', (req) => {
   const fid = req.ctx.farmId
@@ -566,7 +577,7 @@ app.post('/api/production/reorder', ...mutate('reorderJob', 'production/reorder'
   })
 }))
 
-// 完工入库：传 id 领单个，不传则一键全领
+// 完工入库：完工批次随时可入（按差额部分入库）；传 id 领单个，不传则一键全领
 app.post('/api/production/collect', ...mutate('collectJob', 'production/collect', (req) => {
   const fid = req.ctx.farmId
   const p = q1('SELECT abs_day FROM player WHERE farm_id=?', fid)

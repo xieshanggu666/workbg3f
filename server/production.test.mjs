@@ -145,6 +145,79 @@ assert(part.refundBatches === 1 && (part.refunds[0]?.qty) === 2 && part.finished
 const partial = P.collectJobs(11, FID, jp.id)
 assert(partial.picked[0]?.qty === 1, '取消单的已完工批次仍可入库 1 个面粉')
 
+// ===== 8) 完工批次随时入库：在制工单按差额部分入库，重复入库被拒 =====
+// （此时库存：基础麦18 / 品种麦4 / 面粉5）
+const j5 = P.enqueueJob({ recipeId: 'flour', qty: 4, millLevel: 5, currentAbs: 11, farmId: FID, userId: 2, userName: '阿强' })
+P.settleProduction(12, FID) // j5 第1批完工，其余在制
+const c1 = P.collectJobs(12, FID, j5.id)
+assert(c1.picked[0]?.qty === 1, '在制工单第12天先入库 1 批完工成品')
+let dupErr = null
+try { P.collectJobs(12, FID, j5.id) } catch (e) { dupErr = e }
+assert(dupErr?.status === 400, '同批成品重复入库被拒（无新增完工批次）')
+assert(q1(`SELECT qty FROM inventory WHERE farm_id=7 AND item_id='flour'`).qty === 6, '面粉库存只增加一次（5→6），不重复发放')
+const j5v = P.listJobs(12, FID).find((x) => x.id === j5.id)
+assert(j5v.collectedBatches === 1 && j5v.pendingBatches === 0 && j5v.computedStatus === 'running',
+  '部分入库后工单仍在制，记录已入库 1 批')
+assert(j5v.reducibleBatches === 2, '第12天 j5 已开工2批，可减量 2 批')
+P.settleProduction(13, FID)
+assert(P.listJobs(13, FID).find((x) => x.id === j5.id).pendingBatches === 1, '第13天又有 1 批完工待入库')
+
+// ===== 9) 未开工批次按需减量：按登记品种退料，占用与后续排期联动 =====
+// 阿珍排 7 批：基础麦10 + 品种麦4 全部投料（批次5/6 为品种麦投料）
+const j6 = P.enqueueJob({ recipeId: 'flour', qty: 7, millLevel: 5, currentAbs: 13, farmId: FID, userId: 3, userName: '阿珍' })
+assert(!q1('SELECT 1 FROM inventory WHERE farm_id=7 AND item_id=?', 'crop-5'), 'j6 投料耗尽基础小麦')
+const resBefore = P.reservedStock(13, FID).reduce((m, x) => (m[x.itemId] = x.qty, m), {})
+assert(resBefore['crop-5'] === 18 && resBefore['crop-v1000'] === 4, `减量前占用 基础18/品种4（得到 ${JSON.stringify(resBefore)}）`)
+// 减 3 批：退尾部批次5/6（品种麦）+批次4（基础麦）
+const red1 = P.reduceJob({ id: j6.id, reduce: 3, currentAbs: 13, farmId: FID, userId: 3, role: 'member' })
+const red1m = red1.refunds.reduce((m, x) => (m[x.itemId] = x.qty, m), {})
+assert(red1.reduced === 3 && red1m['crop-v1000'] === 4 && red1m['crop-5'] === 2,
+  `减量按登记品种原样退料（品种4+基础2，得到 ${JSON.stringify(red1m)}）`)
+assert(q1('SELECT qty FROM inventory WHERE farm_id=7 AND item_id=?', 'crop-v1000').qty === 4, '品种小麦退回库存')
+const resAfter = P.reservedStock(13, FID).reduce((m, x) => (m[x.itemId] = x.qty, m), {})
+assert(resAfter['crop-5'] === 16 && !resAfter['crop-v1000'], `减量后库存占用联动下降（得到 ${JSON.stringify(resAfter)}）`)
+assert(JSON.parse(q1('SELECT inputs FROM production_jobs WHERE id=?', j6.id).inputs).length === 4, 'inputs 同步裁剪为 4 批')
+// 后续工单排期联动：j7 接在 j6 后，j6 再减 2 批后 j7 提前
+const j7 = P.enqueueJob({ recipeId: 'flour', qty: 1, millLevel: 5, currentAbs: 13, farmId: FID, userId: 1, userName: '场主' })
+const j7StartBefore = P.listJobs(13, FID).find((x) => x.id === j7.id).start
+let permErr2 = null
+try { P.reduceJob({ id: j6.id, reduce: 2, currentAbs: 13, farmId: FID, userId: 2, role: 'member' }) } catch (e) { permErr2 = e }
+assert(permErr2?.status === 403, '成员不能减量他人排产的工单')
+const red2 = P.reduceJob({ id: j6.id, reduce: 2, currentAbs: 13, farmId: FID, userId: 1, role: 'owner' })
+assert(red2.remainQty === 2 && red2.refunds[0]?.qty === 4, '场主可减量成员工单，再退 2 批基础麦')
+const j7StartAfter = P.listJobs(13, FID).find((x) => x.id === j7.id).start
+assert(j7StartAfter < j7StartBefore, `j6 减量后 j7 排期提前（${j7StartBefore}→${j7StartAfter}）`)
+assert(P.listJobs(13, FID).find((x) => x.id === j6.id).reducibleBatches === 2, 'j6 未开工，剩余 2 批均可减')
+
+// ===== 10) 旧工单兼容：无投料登记（inputs=NULL）减量/取消回退配方原料退料 =====
+const legacy = P.enqueueJob({ recipeId: 'flour', qty: 3, millLevel: 5, currentAbs: 13, farmId: FID, userId: 2, userName: '阿强' })
+run('UPDATE production_jobs SET inputs=NULL WHERE id=?', legacy.id) // 模拟升级前旧工单
+const legRed = P.reduceJob({ id: legacy.id, reduce: 1, currentAbs: 13, farmId: FID, userId: 2, role: 'member' })
+assert(legRed.refunds.length === 1 && legRed.refunds[0].itemId === 'crop-5' && legRed.refunds[0].qty === 2,
+  '旧工单减量回退按配方原料（小麦×2）退料')
+const legCancel = P.cancelJob({ id: legacy.id, currentAbs: 13, farmId: FID, userId: 2, role: 'member' })
+assert(legCancel.refundBatches === 2 && legCancel.refunds[0].itemId === 'crop-5', '旧工单取消剩余批次仍按配方退料')
+
+// ===== 11) 减到 0 = 取消；已结束工单不可减；完工工单全量入库后出队 =====
+const j8 = P.enqueueJob({ recipeId: 'flour', qty: 2, millLevel: 5, currentAbs: 13, farmId: FID, userId: 2, userName: '阿强' })
+const red0 = P.reduceJob({ id: j8.id, reduce: 5, currentAbs: 13, farmId: FID, userId: 2, role: 'member' })
+assert(red0.reduced === 2 && red0.remainQty === 0, '减量超过未开工批次数时收缩为全减')
+assert(q1('SELECT status FROM production_jobs WHERE id=?', j8.id).status === 'canceled', '减到 0 批等同取消')
+assert(!P.listJobs(13, FID).some((x) => x.id === j8.id), '全减工单直接出队')
+P.settleProduction(15, FID) // j5 全部完工
+let fullErr = null
+try { P.reduceJob({ id: j5.id, reduce: 1, currentAbs: 15, farmId: FID, userId: 2, role: 'member' }) } catch (e) { fullErr = e }
+assert(fullErr?.status === 400, '全部批次已完工/已开工的工单不可减量')
+const c2 = P.collectJobs(15, FID, j5.id)
+assert(c2.picked[0]?.qty === 3, 'j5 剩余 3 批完工后一次入库（累计 4 批）')
+assert(!P.listJobs(15, FID).some((x) => x.id === j5.id), '全部入库后工单出队')
+assert(q1(`SELECT qty FROM inventory WHERE farm_id=7 AND item_id='flour'`).qty === 9, '面粉累计入库 9 个（j1×3+j4×1+jp×1+j5×4）')
+// 一键入库收尾：j6（2批）+ j7（1批）
+P.settleProduction(30, FID)
+const cAll = P.collectJobs(30, FID)
+assert(cAll.picked.reduce((s, p) => s + p.qty, 0) === 3, '一键入库领走全部待入库批次（2+1）')
+assert(P.listJobs(30, FID).length === 0, '全部工单入库后队列清空')
+
 db.close()
 rmSync(tmp, { recursive: true, force: true })
 console.log(failures ? `\n${failures} 个断言失败` : '\n全部通过 🎉')
