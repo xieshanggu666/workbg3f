@@ -220,6 +220,18 @@ function jobInputs(j) {
   }
   return mergeItems(items)
 }
+// 前 cutoff 批（已完工/已开工）的投料合并明细
+// 旧工单 inputs 为 NULL 时按配方原料 × 批数回退（兼容历史工单）
+function batchInputs(j, cutoff) {
+  const items = []
+  const batches = parseInputs(j.inputs)
+  if (batches.length) {
+    for (const batch of batches.slice(0, cutoff)) for (const it of batch || []) items.push(it)
+  } else if (j.consume > 0) {
+    items.push({ itemId: j.from_id, name: j.from_name, cat: j.from_cat, qty: j.consume * cutoff })
+  }
+  return mergeItems(items)
+}
 // 取消时按批次序号退还的原料（未开工尾部批次），返回合并明细
 function refundableItems(j, startedBatches) {
   let items = []
@@ -232,31 +244,56 @@ function refundableItems(j, startedBatches) {
   }
   return mergeItems(items)
 }
+// 按需减量时退还的原料：裁掉尾部 n 批（调用方保证这些批次均未开工）
+function reduceRefundItems(j, reduceBatches) {
+  const keep = j.qty - reduceBatches
+  let items = []
+  const batches = parseInputs(j.inputs)
+  if (batches.length) {
+    for (const batch of batches.slice(keep, j.qty)) for (const it of batch || []) items.push(it)
+  } else if (j.consume > 0) {
+    items = [{ itemId: j.from_id, name: j.from_name, cat: j.from_cat, qty: j.consume * reduceBatches }]
+  }
+  return mergeItems(items)
+}
 
-// 当前在队（未领走）的工单 + 动态状态
+// 当前在队（未全部领走）的工单 + 动态状态
 export function listJobs(currentAbs, farmId) {
   const jobs = []
   for (const j of allJobs(farmId)) {
-    if (j.status === 'collected') continue
+    const collected = Math.max(0, j.collected || 0)
+    j.collectedBatches = collected
     j.doneBatches = finishedBatchesAt(j, currentAbs)
-    // 已全部退料的取消工单没有可领成品，直接出队
-    if (j.status === 'canceled' && j.doneBatches === 0) continue
+    // 已取消：可入库成品在取消时定格（取消后的跨天结算不再给它产出）
+    const availableBatches = j.status === 'canceled' ? j.finished : j.doneBatches
+    // 可随时入库：已完工但尚未领走的批次（运行中工单也能分批领）
+    j.collectableBatches = Math.max(0, availableBatches - collected)
+    // 成品已全部领走的工单直接出队：取消单/历史 collected 单无可领即走；
+    // 运行单须全部完工且领净（仍在加工的运行单即便暂无可领也要留在队列里）
+    if (j.collectableBatches === 0 &&
+        (j.status === 'canceled' || j.status === 'collected' ||
+         (j.status === 'running' && j.doneBatches >= j.qty))) continue
     j.startedBatches = j.status === 'canceled'
       ? startedBatchesAt(j, j.cancel_abs)
       : startedBatchesAt(j, currentAbs)
     // 取消时实际退料的批次数 = 取消时点尚未开工的批次
     j.refundedBatches = j.status === 'canceled' ? Math.max(0, j.qty - j.startedBatches) : 0
+    // 仍占队列/机器的批次：未完工（含加工中、排队中）；已完工批次等入库，不再占机器
     j.waitingBatches = j.status === 'running' ? j.qty - j.doneBatches : 0
+    // 未开工批次：可按需减量的那部分
+    j.reducibleBatches = j.status === 'running'
+      ? Math.max(0, j.qty - startedBatchesAt(j, currentAbs)) : 0
     j.computedStatus = j.status === 'running'
       ? (j.doneBatches >= j.qty ? 'done' : 'running')
       : j.status
     j.remainDays = j.computedStatus === 'running'
       ? Math.max(0, j.finish - currentAbs)
       : 0
-    // 协作信息：排产人 + 尚未产出的在制工单仍占着原料（全部投料）；
-    // 取消单展示取消时实际退回的那部分原料明细
+    // 协作信息：排产人
     j.creator = j.created_by ? { id: j.created_by, name: j.created_name || '' } : null
-    j.occupiedItems = j.status === 'running' ? jobInputs(j) : []
+    // 在制工单仍锁着的原料 = 尚未完工批次的投料（已完工批次已变成待入库成品，不再占原料）
+    j.occupiedItems = j.status === 'running' ? unfinishedInputs(j) : []
+    // 当前若取消可退（未开工批次）明细
     j.refundableItems = j.status === 'running' ? refundableItems(j, j.startedBatches) : []
     j.refundedItems = j.status === 'canceled' && j.refundedBatches > 0
       ? refundableItems(j, j.startedBatches) : []
@@ -265,13 +302,26 @@ export function listJobs(currentAbs, farmId) {
   return jobs
 }
 
+// 在制工单尚未完工批次的投料（这些批次还占着原料）；
+// 已完工批次已转为成品待入库。未完工批次 = 尾部 (qty-done) 批，
+// 其投料 = 总投料 − 前 done 批投料（旧工单 inputs 为 NULL 时按配方原料回退）。
+function unfinishedInputs(j) {
+  const doneMap = new Map(batchInputs(j, j.doneBatches).map((it) => [it.itemId, it.qty]))
+  const items = []
+  for (const it of jobInputs(j)) {
+    const qty = it.qty - (doneMap.get(it.itemId) || 0)
+    if (qty > 0) items.push({ ...it, qty })
+  }
+  return items
+}
+
 // 当前队列里被在制工单占用（已投料、尚未变成成品）的原料汇总，按物品合并
 // 供库存页展示「可用 / 被工单占用」——排产扣料后剩余库存即空闲可用量
 export function reservedStock(currentAbs, farmId) {
   const m = new Map()
   for (const j of listJobs(currentAbs, farmId)) {
     if (j.status !== 'running') continue
-    for (const it of jobInputs(j)) {
+    for (const it of unfinishedInputs(j)) {
       const cur = m.get(it.itemId)
       if (cur) cur.qty += it.qty
       else m.set(it.itemId, { ...it })
@@ -356,28 +406,81 @@ export function canManageJob(j, userId, role) {
 // 已完工批次保留成品待入库，加工中批次随取消作废。
 // 退料按排产时逐批登记的实际投料（可能含杂交品种作物）原样退回，
 // 而不是统一退成配方本源基础作物；旧工单无登记时回退按配方原料退。
+// 防多人重复：状态/排期/退料全部在 IMMEDIATE 事务内重读计算，
+// 已取消/已减量的批次不会二次退料。
 export function cancelJob({ id, currentAbs, farmId, userId, role }) {
-  const j = q1('SELECT * FROM production_jobs WHERE farm_id=? AND id=?', farmId, id)
-  if (!j) throw Object.assign(new Error('工单不存在'), { status: 404 })
-  if (j.status !== 'running') throw Object.assign(new Error('该工单已结束，无法取消'), { status: 400 })
-  if (!canManageJob(j, userId, role)) {
+  const j0 = q1('SELECT * FROM production_jobs WHERE farm_id=? AND id=?', farmId, id)
+  if (!j0) throw Object.assign(new Error('工单不存在'), { status: 404 })
+  if (j0.status !== 'running') throw Object.assign(new Error('该工单已结束，无法取消'), { status: 400 })
+  if (!canManageJob(j0, userId, role)) {
     throw Object.assign(new Error('只能取消自己排产的工单（管理员可取消任意工单）'), { status: 403 })
   }
 
-  const cur = allJobs(farmId).find((x) => x.id === id)
-  const finishedBatches = finishedBatchesAt(cur, currentAbs)
-  // 正在加工的批次已投入原料、尚未产出，取消即作废；只退还没开工的批次
-  const startedBatches = startedBatchesAt(cur, currentAbs)
-  const refundBatches = Math.max(0, j.qty - startedBatches)
-  const refunds = refundableItems(j, startedBatches)
-
   db.exec('BEGIN IMMEDIATE')
   try {
+    // 事务内重读：并发下另一成员可能已取消/减量，以落库状态为准
+    const j = q1('SELECT * FROM production_jobs WHERE farm_id=? AND id=?', farmId, id)
+    if (j.status !== 'running') throw Object.assign(new Error('该工单已结束，无法取消'), { status: 400 })
+    const cur = replay(q('SELECT * FROM production_jobs WHERE farm_id=? ORDER BY seq, id', farmId)
+      .map((x) => ({ ...x }))).find((x) => x.id === id)
+    const finishedBatches = finishedBatchesAt(cur, currentAbs)
+    // 正在加工的批次已投入原料、尚未产出，取消即作废；只退还没开工的批次
+    const startedBatches = startedBatchesAt(cur, currentAbs)
+    const refundBatches = Math.max(0, j.qty - startedBatches)
+    const refunds = refundableItems(j, startedBatches)
     run('UPDATE production_jobs SET status=\'canceled\', cancel_abs=?, finished=? WHERE id=?',
       currentAbs, finishedBatches, id)
     for (const it of refunds) addInv(farmId, it.itemId, it.name, it.cat, it.qty)
     db.exec('COMMIT')
     return { ok: true, refundBatches, finishedBatches, refunds }
+  } catch (e) {
+    try { db.exec('ROLLBACK') } catch { /* 事务可能已结束，忽略 */ }
+    throw e
+  }
+}
+
+// 按需减量：运行中工单裁掉尾部 n 批「尚未开工」的批次，按实际投料原样退料。
+// 已完工/加工中的批次不能减；减量后批次数变小，replay 自动缩短占用机器时间，
+// 后续排队工单随之提前、队列容量与原料占用同步释放。
+// 与取消共用同一套防多人重复机制（事务内重读状态 + 只退未落库批次的料）。
+export function reduceJob({ id, n, currentAbs, farmId, userId, role }) {
+  const cut = Math.max(1, Math.floor(Number(n) || 0))
+  if (cut <= 0) throw Object.assign(new Error('减量批次数非法'), { status: 400 })
+  const j0 = q1('SELECT * FROM production_jobs WHERE farm_id=? AND id=?', farmId, id)
+  if (!j0) throw Object.assign(new Error('工单不存在'), { status: 404 })
+  if (j0.status !== 'running') throw Object.assign(new Error('该工单已结束，无法减量'), { status: 400 })
+  if (!canManageJob(j0, userId, role)) {
+    throw Object.assign(new Error('只能调整自己排产的工单（管理员可调整任意工单）'), { status: 403 })
+  }
+
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const j = q1('SELECT * FROM production_jobs WHERE farm_id=? AND id=?', farmId, id)
+    if (j.status !== 'running') throw Object.assign(new Error('该工单已结束，无法减量'), { status: 400 })
+    const cur = replay(q('SELECT * FROM production_jobs WHERE farm_id=? ORDER BY seq, id', farmId)
+      .map((x) => ({ ...x }))).find((x) => x.id === id)
+    const done = finishedBatchesAt(cur, currentAbs)
+    // 加工中批次（startedBatchesAt 含当前正在做的那批）不可减；只能裁未开工尾部批次
+    const reducible = Math.max(0, j.qty - startedBatchesAt(cur, currentAbs))
+    const realCut = Math.min(cut, reducible)
+    if (realCut <= 0) {
+      throw Object.assign(new Error('已开工的批次不能减量，请等完工入库或取消工单'), { status: 400 })
+    }
+    const newQty = j.qty - realCut
+    const refunds = reduceRefundItems(j, realCut)
+    // 裁掉尾部批次：qty 与逐批投料登记同步截断（否则占用/再减量/再取消仍按旧批数算料）
+    const keptInputs = parseInputs(j.inputs).slice(0, newQty)
+    run('UPDATE production_jobs SET qty=?, inputs=? WHERE farm_id=? AND id=?',
+      newQty, j.inputs ? JSON.stringify(keptInputs) : null, farmId, id)
+    for (const it of refunds) addInv(farmId, it.itemId, it.name, it.cat, it.qty)
+    // 重算减量后后续工单的排期信息仅用于响应预览
+    const after = replay(q('SELECT * FROM production_jobs WHERE farm_id=? ORDER BY seq, id', farmId)
+      .map((x) => ({ ...x }))).find((x) => x.id === id)
+    db.exec('COMMIT')
+    return {
+      ok: true, qty: newQty, cutBatches: realCut, doneBatches: done,
+      refunds, finish: after.finish
+    }
   } catch (e) {
     try { db.exec('ROLLBACK') } catch { /* 事务可能已结束，忽略 */ }
     throw e
@@ -419,34 +522,48 @@ export function reorderJob({ id, dir, currentAbs, farmId }) {
   }
 }
 
-// 完工入库：领取指定工单成品；不传 id 则一键领取全部待入库工单
+// 完工入库：领取指定工单「已完工但尚未领走」的批次成品；不传 id 则一键领取全部待入库批次。
+// 运行中工单也可随时分批入库（领完已完工批次后继续加工剩余批次）；
+// 已取消工单只领取消时定格的成品；全部批次领完后状态置 collected 出队。
+// 防多人重复：collected 计数只增不减，入库量 = finished − collected，
+// 状态/计数在 IMMEDIATE 事务内重读更新，多端连点不会重复发成品。
 export function collectJobs(currentAbs, farmId, id = null) {
-  const rows = id
-    ? q("SELECT * FROM production_jobs WHERE farm_id=? AND id=? AND status!='collected'", farmId, id)
-    : q("SELECT * FROM production_jobs WHERE farm_id=? AND status!='collected' ORDER BY seq, id", farmId)
-  if (!rows.length) throw Object.assign(new Error('没有可入库的工单'), { status: 400 })
-
-  const byId = new Map(allJobs(farmId).map((j) => [j.id, j]))
-
-  const picked = []
+  const targetId = id == null ? null : Number(id)
   db.exec('BEGIN IMMEDIATE')
   try {
-    for (const j of rows) {
-      const batches = finishedBatchesAt(byId.get(j.id), currentAbs)
-      // 只有全部完工或已取消的工单才能入库（在制工单按整单领取，避免丢批次）
-      const settled = j.status === 'canceled' || batches >= j.qty
-      if (!settled || batches <= 0) {
-        if (id) {
-          throw Object.assign(
-            new Error(batches <= 0 ? '该工单尚无完工批次' : '工单尚未全部完工，完工后才能入库'),
-            { status: 400 }
-          )
+    // 事务内重读候选工单（并发下另一成员可能刚领过/取消过，以落库状态为准）
+    const rows = targetId != null
+      ? q('SELECT * FROM production_jobs WHERE farm_id=? AND id=?', farmId, targetId)
+      : q("SELECT * FROM production_jobs WHERE farm_id=? AND status!='collected' ORDER BY seq, id", farmId)
+    if (!rows.length) throw Object.assign(new Error('工单不存在'), { status: 404 })
+
+    // 排期在事务内重放，完工批次数与取消定格值均按最新落库状态计算
+    const byId = new Map(
+      replay(q('SELECT * FROM production_jobs WHERE farm_id=? ORDER BY seq, id', farmId)
+        .map((x) => ({ ...x }))).map((j) => [j.id, j])
+    )
+
+    const picked = []
+    for (const j0 of rows) {
+      const j = j0.status === 'canceled' || j0.status === 'collected'
+        ? j0
+        : byId.get(j0.id) || j0
+      const available = j0.status === 'canceled' ? j0.finished : finishedBatchesAt(j, currentAbs)
+      const already = Math.max(0, j0.collected || 0)
+      const batches = Math.max(0, available - already)
+      if (batches <= 0) {
+        if (targetId != null) {
+          throw Object.assign(new Error('该工单暂无新完工批次可入库'), { status: 400 })
         }
         continue
       }
-      addInv(farmId, j.result_id, j.result_name, j.result_cat, j.gain * batches)
-      run("UPDATE production_jobs SET status='collected' WHERE id=?", j.id)
-      picked.push({ name: j.result_name, qty: j.gain * batches })
+      addInv(farmId, j0.result_id, j0.result_name, j0.result_cat, j0.gain * batches)
+      const newCollected = already + batches
+      // 可领批次已领净：运行单全部完工或取消单 → collected 出队；运行中工单领完仍在队列继续加工
+      const fullyDone = j0.status === 'canceled' || available >= j0.qty
+      run('UPDATE production_jobs SET collected=?, status=? WHERE id=?',
+        newCollected, fullyDone ? 'collected' : 'running', j0.id)
+      picked.push({ id: j0.id, name: j0.result_name, qty: j0.gain * batches })
     }
     if (!picked.length) throw Object.assign(new Error('没有可入库的成品'), { status: 400 })
     db.exec('COMMIT')

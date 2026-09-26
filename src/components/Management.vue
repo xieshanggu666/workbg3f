@@ -122,8 +122,9 @@
                  :title="store.onlineUserIds.has(j.creator.id) ? '排产人在线' : '排产人离线'"></i>
             </span>
           </b>
-          <span class="tag">批次 {{ j.doneBatches }}/{{ j.qty }}</span>
+          <span class="tag">批次 完工{{ j.doneBatches }}/{{ j.qty }}<template v-if="j.collectedBatches"> · 已入库{{ j.collectedBatches }}</template></span>
           <span class="tag" v-if="j.computedStatus==='running'">⏳ 约剩 {{ j.remainDays }} 天</span>
+          <span class="tag" v-if="j.reducibleBatches>0">可减量 {{ j.reducibleBatches }} 批</span>
           <span class="tag" v-if="j.status==='canceled' && j.refundedBatches>0">已退 {{ j.refundedBatches }} 批原料</span>
           <span class="tag held-line" v-if="j.status==='running' && j.occupiedItems && j.occupiedItems.length">
             🔒投料
@@ -137,14 +138,26 @@
               {{ itemIcon(it.itemId) }}{{ it.name }}×{{ it.qty }}
             </i>
           </span>
-          <div class="job-bar"><i :style="{width:(j.doneBatches/j.qty*100)+'%'}"></i></div>
+          <div class="job-bar">
+            <i class="b-done" :style="{width:(j.doneBatches/j.qty*100)+'%'}"></i>
+            <i class="b-got" :style="{width:(j.collectedBatches/j.qty*100)+'%'}"></i>
+          </div>
         </div>
+        <!-- 按需减量：只能裁尚未开工的批次（加工中/已完工不可减） -->
+        <template v-if="j.status==='running' && j.reducibleBatches>0">
+          <button class="mini reduce" :disabled="!store.canManageJob(j)"
+                  :title="store.canManageJob(j) ? '裁掉最后 1 批未开工批次并退回原料' : '只能调整自己排产的工单'"
+                  @click="store.reduceProduction(j.id,1)">减量×1</button>
+          <button class="mini reduce" :disabled="!store.canManageJob(j)"
+                  :title="`裁掉全部 ${j.reducibleBatches} 批未开工批次并退回原料`"
+                  @click="store.reduceProduction(j.id,j.reducibleBatches)">减量×{{ j.reducibleBatches }}</button>
+        </template>
         <button v-if="j.status==='running'" class="mini" :disabled="!store.canManageJob(j)"
                 :title="store.canManageJob(j) ? '取消未开工批次并退回原料' : '只能取消自己排产的工单'"
                 @click="store.cancelProduction(j.id)">取消退料</button>
-        <button v-if="(j.computedStatus==='done' || j.status==='canceled') && j.doneBatches>0"
-                class="mini green" @click="store.collectProduction(j.id)">
-          入库 ×{{ j.gain*j.doneBatches }}
+        <!-- 完工批次随时入库：运行中/已取消工单只要有未领的完工批次即可领 -->
+        <button v-if="j.collectableBatches>0" class="mini green" @click="store.collectProduction(j.id)">
+          入库 ×{{ j.gain*j.collectableBatches }}
         </button>
       </div>
     </div>
@@ -347,16 +360,17 @@ function canMove(index, dir) {
 function refundedOf(j) {
   return j.refundedItems || []
 }
-// 可入库 = 全部完工 或 已取消（在制工单须整单完工后才能领）
+// 可入库 = 有「已完工但尚未领走」的批次（运行中工单也可分批随时入库）
 const collectableJobs = computed(() =>
-  store.productionJobs.filter((j) => (j.computedStatus === 'done' || j.status === 'canceled') && j.doneBatches > 0)
+  store.productionJobs.filter((j) => j.collectableBatches > 0)
 )
 const collectableBatches = computed(() =>
-  collectableJobs.value.reduce((s, j) => s + j.gain * j.doneBatches, 0)
+  collectableJobs.value.reduce((s, j) => s + j.gain * j.collectableBatches, 0)
 )
 function stateLabel(j) {
   if (j.computedStatus === 'done') return '✓ 已完工'
-  if (j.status === 'canceled') return '已取消·待入库'
+  if (j.status === 'canceled') return j.collectableBatches > 0 ? '已取消·待入库' : '已取消'
+  if (j.collectedBatches > 0) return '加工中·部分入库'
   return j.start > (store.player?.abs_day ?? 0) ? '排队中' : '加工中'
 }
 </script>
@@ -420,9 +434,13 @@ h4 { margin:0 0 8px;color:#fff;display:flex;gap:8px;align-items:center; }
 .job-state.running{color:#90caf9;background:#122a47;}
 .job-state.done{color:#a5d6a7;background:#1b3a21;}
 .job-state.canceled{color:#8ba2c8;background:#23304a;}
-.job-bar{width:100%;height:4px;background:#0c1730;border-radius:3px;overflow:hidden;margin-top:3px;}
-.job-bar i{display:block;height:100%;background:linear-gradient(90deg,#2962ff,#5c97ff);transition:width .3s;}
-.job.done .job-bar i{background:#43a047;}
+.job-bar{width:100%;height:4px;background:#0c1730;border-radius:3px;overflow:hidden;margin-top:3px;position:relative;}
+.job-bar i{position:absolute;top:0;left:0;height:100%;transition:width .3s;}
+.job-bar i.b-done{background:linear-gradient(90deg,#2962ff,#5c97ff);}
+.job-bar i.b-got{background:#43a047;}
+.job.done .job-bar i.b-done{background:#43a047;}
+.mini.reduce{background:#6a4b1f;}
+.mini.reduce:disabled{background:#2a3a5e;color:#6f84ab;}
 h4 .collect-all{margin-left:auto;font-size:11px;}
 /* 协作排产 */
 .held-sum{font-size:11px;color:#8ba2c8;margin-bottom:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;}

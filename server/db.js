@@ -237,6 +237,12 @@ if (tableExists('production_jobs')) {
   if (!columnExists('production_jobs', 'created_name')) {
     db.exec('ALTER TABLE production_jobs ADD COLUMN created_name TEXT')
   }
+  // 分批入库：已入库批次数（运行中工单可随时领走已完工批次，重复入库以此幂等拦截）
+  if (!columnExists('production_jobs', 'collected')) {
+    db.exec('ALTER TABLE production_jobs ADD COLUMN collected INTEGER NOT NULL DEFAULT 0')
+    // 旧版整单入库：collected 工单视为已领完全部批次，防止升级后被重复入库
+    db.exec("UPDATE production_jobs SET collected=finished WHERE status='collected'")
+  }
   const needBackfill = q1('SELECT COUNT(*) c FROM production_jobs WHERE seq=0').c
   if (needBackfill) {
     db.exec('UPDATE production_jobs SET seq=id WHERE seq=0')
@@ -392,6 +398,7 @@ CREATE TABLE IF NOT EXISTS production_jobs (
   seq INTEGER NOT NULL DEFAULT 0,       -- 队列顺序（多人协作可重排；历史顺序不再等同于 id）
   created_by INTEGER,                   -- 排产人 users.id（NULL=升级前旧工单，任何成员可管理）
   created_name TEXT,                    -- 排产人昵称快照（成员改名/退出后仍可展示）
+  collected INTEGER NOT NULL DEFAULT 0, -- 已入库批次数（完工批次可随时分批入库；已领过的不会重复发成品）
   status TEXT NOT NULL DEFAULT 'running' -- running/done/canceled/collected
 );
 
@@ -502,7 +509,7 @@ export const ROLE_PERMS = {
     'plant', 'water', 'fertilize', 'clean', 'harvest',
     'protect', 'buymat', 'buyseed', 'sellcrop',
     'adopt', 'feed', 'collect',
-    'enqueue', 'cancelJob', 'collectJob', 'reorderJob',
+    'enqueue', 'cancelJob', 'collectJob', 'reorderJob', 'reduceJob',
     'irrigToggle', 'irrigPriority', 'irrigTarget',
     'careTrial', 'cancelTrial',
     'claimSubmit'

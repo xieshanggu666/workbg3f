@@ -106,7 +106,7 @@ export const useGameStore = defineStore('game', {
       }
       // 成员可用权限白名单（与服务端 ROLE_PERMS.member 对齐）
       return ['plant', 'water', 'fertilize', 'clean', 'harvest', 'protect', 'buymat', 'buyseed',
-        'sellcrop', 'adopt', 'feed', 'collect', 'enqueue', 'cancelJob', 'collectJob', 'reorderJob',
+        'sellcrop', 'adopt', 'feed', 'collect', 'enqueue', 'cancelJob', 'collectJob', 'reorderJob', 'reduceJob',
         'irrigToggle', 'irrigPriority', 'irrigTarget', 'careTrial', 'cancelTrial',
         'claimSubmit'].includes(perm)
     },
@@ -503,6 +503,16 @@ export const useGameStore = defineStore('game', {
         this.showToast(`完工入库：${text}`, 'success')
       }, { denyPerm: 'collectJob' })
     },
+    // 按需减量：裁掉未开工批次并原样退料（成员仅自己的工单，管理员任意）
+    async reduceProduction(id, n) {
+      return this._commit(async () => {
+        const d = await api('/production/reduce', 'POST', { id, n })
+        await this.load({ silent: true })
+        const items = (d.refunds || []).map((it) => `${it.name}×${it.qty}`).join('、')
+        this.showToast(`已减量 ${d.cutBatches} 批（剩 ${d.qty} 批），退回：${items}`, 'info')
+        return d
+      }, { denyPerm: 'reduceJob' })
+    },
     async upgradeBuilding(id) {
       await this._commit(async () => {
         await api('/upgrade', 'POST', { id })
@@ -633,7 +643,8 @@ const ACTION_LABELS = {
   plant: '播种', water: '浇水', fertilize: '施肥', clean: '除虫', harvest: '收获',
   nextday: '时间推进/灾害结算', protect: '防灾投入', buymat: '购买物资', buyseed: '购买种子',
   sellcrop: '出售作物', adopt: '领养动物', feed: '喂食', collect: '收集产物',
-  'production/enqueue': '加工排产', 'production/cancel': '取消工单', 'production/reorder': '队列重排', 'production/collect': '加工入库',
+  'production/enqueue': '加工排产', 'production/cancel': '取消工单', 'production/reorder': '队列重排',
+  'production/reduce': '工单减量', 'production/collect': '加工入库',
   'irrigation/build': '建造灌溉设施', 'irrigation/toggle': '灌溉设施启停', 'irrigation/demolish': '拆除灌溉设施',
   'irrigation/priority': '灌溉优先级', 'irrigation/target': '灌溉目标水分',
   'breeding/start': '杂交试验', 'breeding/care': '试验养护', 'breeding/cancel': '取消试验',

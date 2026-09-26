@@ -4,7 +4,7 @@ import { ensureLegacySeed } from './seed.js'
 import { TYPES, ensureWeather, settleWeather, currentWeather } from './weather.js'
 import {
   RECIPES, capacity, listJobs, queuedBatches, reservedStock,
-  settleProduction, enqueueJob, cancelJob, reorderJob, collectJobs
+  settleProduction, enqueueJob, cancelJob, reorderJob, reduceJob, collectJobs
 } from './production.js'
 import {
   COSTS as IRR_COSTS, RESERVOIR_CAP, networkInfo, computeNetworks, lastReport,
@@ -563,6 +563,17 @@ app.post('/api/production/reorder', ...mutate('reorderJob', 'production/reorder'
   return reorderJob({
     id: Number(req.body?.id), dir: Number(req.body?.dir),
     currentAbs: p.abs_day, farmId: fid
+  })
+}))
+
+// 按需减量：裁掉运行中工单尾部未开工批次并原样退料，联动排期/占用/容量
+app.post('/api/production/reduce', ...mutate('reduceJob', 'production/reduce', (req) => {
+  const fid = req.ctx.farmId
+  const p = q1('SELECT abs_day FROM player WHERE farm_id=?', fid)
+  return reduceJob({
+    id: Number(req.body?.id), n: Number(req.body?.n),
+    currentAbs: p.abs_day, farmId: fid,
+    userId: req.ctx.user.id, role: req.ctx.role
   })
 }))
 
